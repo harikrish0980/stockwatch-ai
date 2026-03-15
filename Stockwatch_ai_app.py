@@ -92,7 +92,6 @@ components.html("""
     function forceSidebar() {
         try {
             var doc = window.parent.document;
-            // Keep sidebar open
             var sidebar = doc.querySelector('[data-testid="stSidebar"]');
             if (sidebar) {
                 if (sidebar.getAttribute('aria-expanded') === 'false') {
@@ -102,7 +101,6 @@ components.html("""
                 sidebar.style.setProperty('margin-left', '0px', 'important');
                 sidebar.style.setProperty('visibility', 'visible', 'important');
             }
-            // Hide ALL collapse/expand buttons
             var btns = doc.querySelectorAll('[data-testid="collapsedControl"], [data-testid="stSidebarCollapseButton"]');
             btns.forEach(function(btn) {
                 btn.style.setProperty('display', 'none', 'important');
@@ -114,7 +112,8 @@ components.html("""
     setInterval(forceSidebar, 500);
 })();
 </script>
-""", height=0)
+""", height=1, scrolling=False)
+st.markdown('<style>iframe{margin-top:-20px !important;height:0px !important;}</style>', unsafe_allow_html=True)
 
 
 # ── PERIOD MAP ──
@@ -129,22 +128,22 @@ PERIOD_MAP = {
     "4hr":   ("3mo",  "1h"),
     "1day":  ("1y",   "1d"),
     "1week": ("1y",   "1wk"),
-    "1mo":   ("6mo",  "1d"),
+    "1mo":   ("1mo",  "1d"),
     "3mo":   ("3mo",  "1d"),
     "6mo":   ("6mo",  "1d"),
     "1yr":   ("1y",   "1d"),
 }
 
 # ── CACHED FUNCTIONS ──
-@st.cache_data(ttl=120)
+@st.cache_data(ttl=300)
 def get_index_data():
     indices = {"S&P 500":"^GSPC","NASDAQ":"^IXIC","DOW JONES":"^DJI","VIX":"^VIX"}
     results = {}
     for name, symbol in indices.items():
         try:
-            info = yf.Ticker(symbol).info
-            price = info.get("regularMarketPrice") or info.get("previousClose",0)
-            prev = info.get("regularMarketPreviousClose",0)
+            fi = yf.Ticker(symbol).fast_info
+            price = fi.last_price or fi.previous_close or 0
+            prev = fi.previous_close or price
             change = ((price-prev)/prev*100) if prev and prev != price else 0
             results[name] = {"price":price,"change":change,"symbol":symbol}
         except:
@@ -159,18 +158,20 @@ def get_chart_data(symbol, period):
     except:
         return pd.DataFrame()
 
-@st.cache_data(ttl=60)
+@st.cache_data(ttl=180)
 def get_live_price(symbol):
     try:
-        info = yf.Ticker(symbol).info
-        price = info.get("currentPrice") or info.get("regularMarketPrice") or info.get("previousClose",0)
-        prev = info.get("regularMarketPreviousClose",price)
+        t = yf.Ticker(symbol)
+        fi = t.fast_info
+        price = fi.last_price or fi.previous_close or 0
+        prev = fi.previous_close or price
         change = ((price-prev)/prev*100) if prev else 0
+        # Get extra details only if needed - use fast_info first
         return {
-            "price":price,"change":change,"company":info.get("shortName",symbol),
-            "high":info.get("dayHigh",0),"low":info.get("dayLow",0),
-            "volume":info.get("regularMarketVolume",0),"market_cap":info.get("marketCap",0),
-            "pre_market":info.get("preMarketPrice",0),"post_market":info.get("postMarketPrice",0),
+            "price":price,"change":change,"company":symbol,
+            "high":fi.day_high or 0,"low":fi.day_low or 0,
+            "volume":fi.last_volume or 0,"market_cap":fi.market_cap or 0,
+            "pre_market":0,"post_market":0,
         }
     except:
         return {"price":0,"change":0,"company":symbol}
@@ -221,12 +222,11 @@ def get_most_active():
     results = []
     for sym in symbols:
         try:
-            t = yf.Ticker(sym)
-            fi = t.fast_info
-            price = fi.last_price or 0
-            prev = fi.previous_close or price
+            info = yf.Ticker(sym).info
+            price = info.get("currentPrice") or info.get("regularMarketPrice",0)
+            prev = info.get("regularMarketPreviousClose",price)
             change = ((price-prev)/prev*100) if prev else 0
-            vol = fi.three_month_average_volume or 0
+            vol = info.get("regularMarketVolume",0)
             results.append({"symbol":sym,"price":price,"change":change,"volume":vol})
         except:
             pass
@@ -235,15 +235,22 @@ def get_most_active():
 @st.cache_data(ttl=300)
 def get_crypto_prices():
     results = []
-    for symbol, name in {"BTC-USD":"Bitcoin","ETH-USD":"Ethereum","SOL-USD":"Solana"}.items():
-        try:
-            fi = yf.Ticker(symbol).fast_info
-            price = fi.last_price or 0
-            prev = fi.previous_close or price
-            change = ((price-prev)/prev*100) if prev else 0
-            results.append({"symbol":symbol.replace("-USD",""),"name":name,"price":price,"change":change})
-        except:
-            pass
+    try:
+        data = yf.download(["BTC-USD","ETH-USD","SOL-USD"], period="2d", progress=False, auto_adjust=True)
+        closes = data['Close']
+        names = {"BTC-USD":"Bitcoin","ETH-USD":"Ethereum","SOL-USD":"Solana"}
+        for symbol, name in names.items():
+            try:
+                prices = closes[symbol].dropna()
+                if len(prices) >= 2:
+                    price = float(prices.iloc[-1])
+                    prev = float(prices.iloc[-2])
+                    change = ((price-prev)/prev*100) if prev else 0
+                    results.append({"symbol":symbol.replace("-USD",""),"name":name,"price":price,"change":change})
+            except:
+                pass
+    except:
+        pass
     return results
 
 def get_sector_data():
@@ -316,17 +323,44 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown('<div class="section-header">⭐ WATCHLIST</div>', unsafe_allow_html=True)
+    # Batch load watchlist prices - much faster than individual calls
+    @st.cache_data(ttl=180)
+    def get_watchlist_prices(symbols_tuple):
+        results = {}
+        try:
+            data = yf.download(list(symbols_tuple), period="2d", progress=False, auto_adjust=True)
+            closes = data['Close']
+            for sym in symbols_tuple:
+                try:
+                    if sym in closes.columns:
+                        prices = closes[sym].dropna()
+                        if len(prices) >= 2:
+                            price = float(prices.iloc[-1])
+                            prev = float(prices.iloc[-2])
+                            change = ((price-prev)/prev*100) if prev else 0
+                            results[sym] = {"price":price,"change":change}
+                        elif len(prices) == 1:
+                            results[sym] = {"price":float(prices.iloc[-1]),"change":0}
+                except:
+                    pass
+        except:
+            pass
+        return results
+
+    wl_prices = get_watchlist_prices(tuple(st.session_state.watchlist))
     for sym in st.session_state.watchlist:
-        d = get_live_price(sym)
+        d = wl_prices.get(sym, {"price":0,"change":0})
         if d["price"] > 0:
             chg_color = "#22c55e" if d["change"]>=0 else "#ef4444"
             arrow = "▲" if d["change"]>=0 else "▼"
             c1,c2 = st.columns([3,2])
             with c1:
                 if st.button(f"{sym} ${d['price']:.2f}", key=f"wl_{sym}", use_container_width=True):
+                    q = f"Tell me about {sym} stock today including price, news and key levels"
                     st.session_state.chart_symbol = sym
-                    st.session_state.ai_question = f"Tell me about {sym} today"
+                    st.session_state.ai_question = q
                     st.session_state.ai_answer = ""
+                    st.session_state.pending_question = q
                     st.rerun()
             with c2:
                 st.markdown(f'<div style="color:{chg_color};font-family:Space Mono,monospace;font-size:0.7rem;padding-top:6px;">{arrow}{abs(d["change"]):.1f}%</div>', unsafe_allow_html=True)
@@ -380,6 +414,8 @@ with st.sidebar:
                     st.session_state.chart_symbol = sym
                     st.session_state.pending_question = q
                     st.rerun()
+        elif quick_symbol and len(quick_symbol.strip()) > 0:
+            st.warning(f"Could not find data for {quick_symbol.upper()}. Check the symbol and try again.")
 
     st.markdown("---")
     st.markdown('<div class="section-header">SAMPLE QUESTIONS</div>', unsafe_allow_html=True)
@@ -420,8 +456,7 @@ with st.sidebar:
 
 # ── MARKET OVERVIEW ──
 st.markdown('<div class="section-header">MARKET OVERVIEW — Click Details for chart & analysis</div>', unsafe_allow_html=True)
-with st.spinner("Loading market indices..."):
-    indices = get_index_data()
+indices = get_index_data()
 
 idx_cols = st.columns(4)
 for i, (name, data) in enumerate(indices.items()):
@@ -461,6 +496,21 @@ if st.session_state.selected_index:
         if st.button("✕ Close Chart", key="close_idx"):
             st.session_state.selected_index = None
             st.rerun()
+
+# Show stale data warning if data is old
+try:
+    import sqlite3
+    conn = sqlite3.connect("stockwatch.db")
+    last_date = pd.read_sql("SELECT MAX(date) as last_date FROM stock_prices", conn).iloc[0]['last_date']
+    conn.close()
+    if last_date:
+        from datetime import date
+        last = date.fromisoformat(str(last_date)[:10])
+        days_old = (date.today() - last).days
+        if days_old > 1:
+            st.warning(f"⚠️ Market data is {days_old} days old (last updated: {last_date[:10]}). Click **Refresh Market Data** in the sidebar to get latest data.")
+except:
+    pass
 
 st.markdown("---")
 
@@ -569,15 +619,17 @@ with left_col:
             fig.add_trace(go.Scatter(x=hist.index,y=bb_m-2*bb_s,line=dict(color='#38bdf8',width=1,dash='dash'),name='BB-',opacity=0.6,fill='tonexty',fillcolor='rgba(56,189,248,0.03)'))
         if show_vol:
             fig.add_trace(go.Bar(x=hist.index,y=hist['Volume'],name='Vol',marker_color='#1e3a5f',opacity=0.4,yaxis='y2'))
-        fig.update_layout(
+        layout_kwargs = dict(
             paper_bgcolor='#0a1221',plot_bgcolor='#0a1221',
             font=dict(family='Space Mono',color='#64748b',size=10),
             xaxis=dict(gridcolor='#0d1929',showgrid=True,rangeslider=dict(visible=False),color='#475569'),
             yaxis=dict(gridcolor='#0d1929',showgrid=True,color='#475569',side='right',autorange=True),
-            yaxis2=dict(overlaying='y',side='left',showgrid=False,color='#1e3a5f',range=[0,hist['Volume'].max()*5]),
             legend=dict(bgcolor='rgba(0,0,0,0)',bordercolor='#1e3a5f',font=dict(color='#94a3b8',size=9),orientation='h',y=1.02),
             margin=dict(l=10,r=10,t=30,b=10),height=400
         )
+        if show_vol and not hist['Volume'].empty:
+            layout_kwargs['yaxis2'] = dict(overlaying='y',side='left',showgrid=False,color='#1e3a5f',range=[0,hist['Volume'].max()*5])
+        fig.update_layout(**layout_kwargs)
         st.plotly_chart(fig, use_container_width=True)
     else:
         st.warning(f"No chart data for {chart_sym} at {chart_per} period. Try a longer period.")
@@ -691,8 +743,7 @@ with right_col:
 
     # SECTOR PERFORMANCE
     st.markdown('<div class="section-header">SECTOR PERFORMANCE</div>', unsafe_allow_html=True)
-    with st.spinner("Loading sectors..."):
-        sector_data = get_sector_data()
+    sector_data = get_sector_data()
     if sector_data:
         sector_df = pd.DataFrame(sector_data).sort_values("Avg Change",ascending=True)
         colors = ['#22c55e' if x>=0 else '#ef4444' for x in sector_df['Avg Change']]
@@ -786,7 +837,8 @@ with right_col:
 
 # FOOTER
 st.markdown("---")
+footer_time = datetime.now().strftime("%Y-%m-%d %H:%M")
 st.markdown(f"""<div style="text-align:center;color:#1e3a5f;font-family:'Space Mono',monospace;font-size:0.65rem;padding:0.8rem;">
 STOCKWATCH AI · Python · Streamlit · Groq LLaMA 3.3 · Yahoo Finance · NewsAPI · 
-{now_local.strftime("%Y-%m-%d %H:%M")} · For informational purposes only. Not financial advice.
+{footer_time} · For informational purposes only. Not financial advice.
 </div>""", unsafe_allow_html=True)
